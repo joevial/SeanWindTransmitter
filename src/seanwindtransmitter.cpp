@@ -6,6 +6,7 @@
 #include <Adafruit_BMP280.h>
 #include <AHTxx.h>
 #include <Wire.h>
+#include <ADS1115_WE.h>
 #include <Preferences.h>
 #include <WiFiUdp.h>
 #include <FastLED.h>
@@ -59,6 +60,16 @@ typedef struct {
   uint8_t magic[4];  // Magic bytes: 0xAB, 0xCD, 0xEF, 0x12
 } slider_values_t;
 
+// Calibration command from receiver
+// magic: 0xCA, 0x1B, 0xCA, 0x1B  ("CALIB")
+typedef struct {
+  uint8_t mode;       // 1 = enter calibration, 0 = exit calibration
+  uint8_t magic[4];
+} calib_command_t;
+
+// Calibration mode state
+bool calibMode = false;
+
 // Preferences for storing WiFi credentials
 Preferences preferences;
 
@@ -95,6 +106,9 @@ const int SAMPLE_INTERVAL_MS = 1000;
 const int GLITCH_FILTER_NS = 4000;
 float windVaneV = 0.0;
 
+// ADS1115 for wind vane
+ADS1115_WE ads1115 = ADS1115_WE(0x48);
+
 const int AVG_WINDOW_SIZE = 60;
 const int GUST_WINDOW_SIZE = 1;
 float windSamples[AVG_WINDOW_SIZE];
@@ -106,7 +120,14 @@ float averageWindSpeed = 0.0;
 float windGust = 0.0;
 
 unsigned long lastSampleTime = 0;
-
+uint16_t readWindADC();
+uint16_t readWindADC() {
+    ads1115.setMeasureMode(ADS1115_SINGLE);
+    ads1115.setCompareChannels(ADS1115_COMP_0_GND);
+    ads1115.startSingleMeasurement();
+    while (ads1115.isBusy()) {}
+    return (uint16_t)ads1115.getRawResult();
+}
 // ESP-NOW callback when transmission is complete
 void OnDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
   // Callback for transmission status
@@ -296,6 +317,19 @@ void handleUDPData() {
         Serial.printf("Received slider values - Avg: %.1f, Gust: %.1f\n", 
                       transmitterAvgWindow, transmitterGustWindow);
       }
+    } else if (len == sizeof(calib_command_t)) {
+      calib_command_t cmd;
+      memcpy(&cmd, buffer, sizeof(cmd));
+      if (cmd.magic[0] == 0xCA && cmd.magic[1] == 0x1B &&
+          cmd.magic[2] == 0xCA && cmd.magic[3] == 0x1B) {
+        calibMode = (cmd.mode == 1);
+        Serial.printf("Calibration mode: %s\n", calibMode ? "ON" : "OFF");
+        // Flash LED cyan briefly to acknowledge
+        leds[0] = calibMode ? CRGB::Cyan : CRGB::Green;
+        FastLED.show();
+        showingGreenLed = true;
+        greenLedTime = millis();
+      }
     }
   }
 }
@@ -443,6 +477,11 @@ void setup() {
   
   Wire.begin(9, 10);
   
+  ads1115.init();
+  ads1115.setVoltageRange_mV(ADS1115_RANGE_4096);  // +/-4.096V range for 3.3V signal
+  ads1115.setConvRate(ADS1115_8_SPS);
+  ads1115.setMeasureMode(ADS1115_SINGLE);
+  
   aht.begin();
   temp = aht.readTemperature();
   hum = aht.readHumidity(AHTXX_USE_READ_DATA);
@@ -519,16 +558,30 @@ void loop() {
   }
 
   every(1000) {
-    winddirAvg.push(analogRead(WINDVANE_PIN));
     updateWindData();
+
+    // Read raw ADC from wind vane and store it. The receiver is responsible
+    // for snapping to calibrated directions and taking the median of 20
+    // readings before committing to history.
+    windVaneV = readWindADC();
 
     if (wifiConnected) {
       // Check for incoming UDP data
       handleUDPData();
     }
   }
-  
-  every(60000) {
+
+  // In calibration mode: also sample wind vane at 500ms and transmit rapidly
+  static uint32_t __calibTx__ = 0;
+  if (calibMode && wifiConnected && (millis() - __calibTx__ >= 500)) {
+    __calibTx__ = millis();
+    // Take a fresh ADC reading for the wind vane (raw, no median, for live calib)
+    windVaneV = readWindADC();
+    sendDataViaUDP();
+  }
+
+  // Sample temp/hum/pressure every 10 seconds (prevent self-heating)
+  every(10000) {
     temp = aht.readTemperature();
     hum = aht.readHumidity(AHTXX_USE_READ_DATA);
     bmp.begin();
@@ -539,9 +592,11 @@ void loop() {
                     Adafruit_BMP280::STANDBY_MS_500);
     bmp.takeForcedMeasurement();
     presread = bmp.readPressure() / 100.0F;
-    windVaneV = winddirAvg.mean();
-    
-    if (wifiConnected) {
+  }
+
+  // Transmit every 3 seconds using the most recently saved sensor values
+  every(3000) {
+    if (wifiConnected && !calibMode) {
       sendDataViaUDP();
     }
   }
